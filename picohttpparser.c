@@ -34,6 +34,9 @@
 #include <x86intrin.h>
 #endif
 #endif
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 #include "picohttpparser.h"
 
 #if __GNUC__ >= 3
@@ -71,9 +74,8 @@
 #define ADVANCE_TOKEN(tok, toklen)                                                                                                 \
     do {                                                                                                                           \
         const char *tok_start = buf;                                                                                               \
-        static const char ALIGNED(16) ranges2[16] = "\000\040\177\177";                                                            \
         int found2;                                                                                                                \
-        buf = findchar_fast(buf, buf_end, ranges2, 4, &found2);                                                                    \
+        buf = findchar_nonprintable_fast(buf, buf_end, &found2);                                                                   \
         if (!found2) {                                                                                                             \
             CHECK_EOF();                                                                                                           \
         }                                                                                                                          \
@@ -131,6 +133,46 @@ static const char *findchar_fast(const char *buf, const char *buf_end, const cha
     return buf;
 }
 
+static const char *findchar_nonprintable_fast(const char *buf, const char *buf_end, int *found)
+{
+#if defined(__ARM_64BIT_STATE) && defined(__ARM_FEATURE_UNALIGNED) && !defined(__ARM_BIG_ENDIAN)
+    *found = 0;
+
+    for (size_t i = (buf_end - buf) / sizeof(uint8x16_t); i; i--) {
+        // This mask makes it possible to pack the comparison result into half a vector,
+        // which has the same size as uint64_t.
+        const uint8x16_t mask = vreinterpretq_u8_u16(vmovq_n_u16(0x8008));
+        uint8x16_t v = vld1q_u8((const uint8_t *) buf);
+
+        v = vorrq_u8(vcltq_u8(v, vmovq_n_u8('\041')), vceqq_u8(v, vmovq_n_u8('\177')));
+        // After masking, a byte in the result does not have the same bits set as any of its neighbours.
+        v = vandq_u8(v, mask);
+        // Pack the comparison result into 64 bits.
+        v = vpaddq_u8(v, v);
+
+        uint64_t offset = vgetq_lane_u64(vreinterpretq_u64_u8(v), 0);
+
+        if (offset) {
+            *found = 1;
+            __asm__ ("rbit %x0, %x0" : "+r" (offset));
+            static_assert(sizeof(unsigned long long) == sizeof(uint64_t),
+                          "Need the number of leading 0-bits in uint64_t.");
+            // offset uses 4 bits per byte of input.
+            buf += __builtin_clzll(offset) / 4;
+            break;
+        }
+
+        buf += sizeof(v);
+    }
+
+    return buf;
+#else
+    static const char ALIGNED(16) ranges2[16] = "\000\040\177\177";
+
+    return findchar_fast(buf, buf_end, ranges2, 4, found);
+#endif
+}
+
 static const char *get_token_to_eol(const char *buf, const char *buf_end, const char **token, size_t *token_len, int *ret)
 {
     const char *token_start = buf;
@@ -143,6 +185,52 @@ static const char *get_token_to_eol(const char *buf, const char *buf_end, const 
     buf = findchar_fast(buf, buf_end, ranges1, 6, &found);
     if (found)
         goto FOUND_CTL;
+#elif defined(__ARM_64BIT_STATE) && defined(__ARM_FEATURE_UNALIGNED) && !defined(__ARM_BIG_ENDIAN)
+    for (size_t i = (buf_end - buf) / (2 * sizeof(uint8x16_t)); i; i--) {
+        const uint8x16_t space = vmovq_n_u8('\040');
+        const uint8x16_t threshold = vmovq_n_u8(0137u);
+        const uint8x16_t v1 = vld1q_u8((const uint8_t *) buf);
+        const uint8x16_t v2 = vld1q_u8((const uint8_t *) buf + sizeof(v1));
+        uint8x16_t v3 = vcgeq_u8(vsubq_u8(v1, space), threshold);
+        uint8x16_t v4 = vcgeq_u8(vsubq_u8(v2, space), threshold);
+
+        v3 = vorrq_u8(v3, v4);
+        // Pack the comparison result into half a vector, i.e. 64 bits; the result will still be non-zero
+        // even if any adjacent bytes are the same (either 0 or 0xFF).
+        v3 = vpaddq_u8(v3, v3);
+
+        if (vgetq_lane_u64(vreinterpretq_u64_u8(v3), 0)) {
+            const uint8x16_t del = vmovq_n_u8('\177');
+            // This mask makes it possible to pack the comparison results into half a vector,
+            // which has the same size as uint64_t.
+            const uint8x16_t mask = vreinterpretq_u8_u32(vmovq_n_u32(0x40100401));
+            const uint8x16_t tab = vmovq_n_u8('\011');
+
+            v3 = vbicq_u8(vcltq_u8(v1, space), vceqq_u8(v1, tab));
+            v4 = vbicq_u8(vcltq_u8(v2, space), vceqq_u8(v2, tab));
+            v3 = vorrq_u8(v3, vceqq_u8(v1, del));
+            v4 = vorrq_u8(v4, vceqq_u8(v2, del));
+            // After masking, four consecutive bytes in the results do not have the same bits set.
+            v3 = vandq_u8(v3, mask);
+            v4 = vandq_u8(v4, mask);
+            // Pack the comparison results into 128, and then 64 bits.
+            v3 = vpaddq_u8(v3, v4);
+            v3 = vpaddq_u8(v3, v3);
+
+            uint64_t offset = vgetq_lane_u64(vreinterpretq_u64_u8(v3), 0);
+
+            if (offset) {
+                __asm__ ("rbit %x0, %x0" : "+r" (offset));
+                static_assert(sizeof(unsigned long long) == sizeof(uint64_t),
+                              "Need the number of leading 0-bits in uint64_t.");
+                // offset uses 2 bits per byte of input.
+                buf += __builtin_clzll(offset) / 2;
+                goto FOUND_CTL;
+            }
+        }
+
+        buf += sizeof(v1) + sizeof(v2);
+    }
 #else
     /* find non-printable char within the next 8 bytes, this is the hottest code; manually inlined */
     while (likely(buf_end - buf >= 8)) {
