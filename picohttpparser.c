@@ -136,9 +136,37 @@ static const char *findchar_fast(const char *buf, const char *buf_end, const cha
 static const char *findchar_nonprintable_fast(const char *buf, const char *buf_end, int *found)
 {
 #if defined(__ARM_64BIT_STATE) && defined(__ARM_FEATURE_UNALIGNED) && !defined(__ARM_BIG_ENDIAN)
+    const size_t len = buf_end - buf;
+
+#ifdef __ARM_FEATURE_SVE
+    int f = 0;
+
+    __asm__ (
+        "dup     z0.b, #127 \n\t"
+        "whilelo p0.b, %[buf], %[buf_end] \n"
+    "1: \n\t"
+        "ld1b    z1.b, p0/z, [%[buf]] \n\t"
+        "cmplo   p1.b, p0/z, z1.b, #33 \n\t"
+        "cmpeq   p2.b, p0/z, z0.b, z1.b \n\t"
+        "orrs    p1.b, p0/z, p1.b, p2.b \n\t"
+        "b.any   1f \n\t"
+        "uqincb  %[buf] \n\t"
+        "whilelo p0.b, %[buf], %[buf_end] \n\t"
+        "b.first 1b \n\t"
+        "mov     %[buf], %[buf_end] \n\t"
+        "b       2f \n"
+    "1: \n\t"
+        "brkb    p0.b, p0/z, p1.b \n\t"
+        "mov     %w[found], #1 \n\t"
+        "incp    %[buf], p0.b \n"
+    "2:" :
+        [buf] "+&r" (buf), [found] "+r" (f) : [buf_end] "r" (buf_end), "m" (*(const char (*)[len]) buf) :
+        "z0", "z1", "p0", "p1", "p2", "cc");
+    *found = f;
+#else
     *found = 0;
 
-    for (size_t i = (buf_end - buf) / sizeof(uint8x16_t); i; i--) {
+    for (size_t i = len / sizeof(uint8x16_t); i; i--) {
         // This mask makes it possible to pack the comparison result into half a vector,
         // which has the same size as uint64_t.
         const uint8x16_t mask = vreinterpretq_u8_u16(vmovq_n_u16(0x8008));
@@ -164,6 +192,7 @@ static const char *findchar_nonprintable_fast(const char *buf, const char *buf_e
 
         buf += sizeof(v);
     }
+#endif
 
     return buf;
 #else
@@ -186,7 +215,43 @@ static const char *get_token_to_eol(const char *buf, const char *buf_end, const 
     if (found)
         goto FOUND_CTL;
 #elif defined(__ARM_64BIT_STATE) && defined(__ARM_FEATURE_UNALIGNED) && !defined(__ARM_BIG_ENDIAN)
-    for (size_t i = (buf_end - buf) / (2 * sizeof(uint8x16_t)); i; i--) {
+    const size_t len = buf_end - buf;
+
+#ifdef __ARM_FEATURE_SVE
+    int found = 0;
+
+    __asm__ (
+        "dup     z0.b, #127 \n"
+        "whilelo p0.b, %[buf], %[buf_end] \n"
+    "1: \n\t"
+        "ld1b    z1.b, p0/z, [%[buf]] \n\t"
+        "movprfx z2, z1 \n\t"
+        "sub     z2.b, z2.b, #32 \n\t"
+        "cmphs   p1.b, p0/z, z2.b, #95 \n\t"
+        "b.any   1f \n"
+    "2: \n\t"
+        "uqincb  %[buf] \n\t"
+        "whilelo p0.b, %[buf], %[buf_end] \n\t"
+        "b.first 1b \n\t"
+        "mov     %[buf], %[buf_end] \n\t"
+        "b       2f \n"
+    "1: \n\t"
+        "cmplo   p1.b, p0/z, z1.b, #32 \n\t"
+        "cmpeq   p2.b, p0/z, z0.b, z1.b \n\t"
+        "cmpne   p1.b, p1/z, z1.b, #9 \n\t"
+        "orrs    p1.b, p0/z, p1.b, p2.b \n\t"
+        "b.none  2b \n\t"
+        "brkb    p0.b, p0/z, p1.b \n\t"
+        "mov     %w[found], #1 \n\t"
+        "incp    %[buf], p0.b \n"
+    "2:" :
+        [buf] "+&r" (buf), [found] "+r" (found) : [buf_end] "r" (buf_end), "m" (*(const char (*)[len]) buf) :
+        "z0", "z1", "z2", "p0", "p1", "p2", "cc");
+
+    if (found)
+        goto FOUND_CTL;
+#else
+    for (size_t i = len / (2 * sizeof(uint8x16_t)); i; i--) {
         const uint8x16_t space = vmovq_n_u8('\040');
         const uint8x16_t threshold = vmovq_n_u8(0137u);
         const uint8x16_t v1 = vld1q_u8((const uint8_t *) buf);
@@ -231,6 +296,7 @@ static const char *get_token_to_eol(const char *buf, const char *buf_end, const 
 
         buf += sizeof(v1) + sizeof(v2);
     }
+#endif
 #else
     /* find non-printable char within the next 8 bytes, this is the hottest code; manually inlined */
     while (likely(buf_end - buf >= 8)) {
@@ -379,6 +445,33 @@ static const char *parse_headers(const char *buf, const char *buf_end, struct ph
                                                       "{\377"; /* 0x7b-0xff */
             int found;
             buf = findchar_fast(buf, buf_end, ranges1, sizeof(ranges1) - 1, &found);
+
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_UNALIGNED) && !defined(__ARM_BIG_ENDIAN)
+            const size_t len = buf_end - buf;
+
+            __asm__ (
+                "whilelo p0.s, %[buf], %[buf_end] \n"
+            "1: \n\t"
+                "ld1b    z0.s, p0/z, [%[buf]] \n\t"
+                "ld1b    { z0.s }, p0/z, [%[token_char_map], z0.s, UXTW] \n\t"
+                "cmpeq   p1.s, p0/z, z0.s, #0 \n\t"
+                "b.any   1f \n"
+                "uqincw  %[buf] \n\t"
+                "whilelo p0.s, %[buf], %[buf_end] \n\t"
+                "b.first 1b \n\t"
+                "mov     %[buf], %[buf_end] \n\t"
+                "b       2f \n"
+            "1: \n\t"
+                "brkb    p0.b, p0/z, p1.b \n\t"
+                "mov     %w[found], #1 \n\t"
+                "incp    %[buf], p0.s \n"
+            "2:" :
+                [buf] "+&r" (buf), [found] "+r" (found) :
+                [buf_end] "r" (buf_end), [token_char_map] "r" (token_char_map),
+                "m" (*(const char (*)[len]) buf), "m" (*(const char (*)[sizeof(token_char_map)]) token_char_map) :
+                "z0", "p0", "p1", "cc");
+#endif
+
             if (!found) {
                 CHECK_EOF();
             }
