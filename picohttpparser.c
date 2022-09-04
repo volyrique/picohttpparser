@@ -34,6 +34,9 @@
 #include <x86intrin.h>
 #endif
 #endif
+#ifdef __ARM_FEATURE_SVE
+#include <arm_sve.h>
+#endif
 #include "picohttpparser.h"
 
 #if __GNUC__ >= 3
@@ -258,6 +261,32 @@ static const char *parse_token(const char *buf, const char *buf_end, const char 
     const char *buf_start = buf;
     int found;
     buf = findchar_fast(buf, buf_end, ranges, sizeof(ranges) - 1, &found);
+
+#ifdef __ARM_FEATURE_SVE
+    if (!found) {
+        for (uint64_t i = 0;; i = svqincw(i, 1)) {
+            const uint64_t len = buf_end - buf;
+            const svbool_t pg = svwhilelt_b32(i, len);
+
+            if (!svptest_first(svptrue_b32(), pg)) {
+                buf = buf_end;
+                break;
+            }
+
+            const svuint32_t offsets = svld1ub_u32(pg, (const uint8_t *)buf + i);
+            const svuint32_t v = svld1ub_gather_offset_u32(pg, (const uint8_t *)token_char_map, offsets);
+            svbool_t c = svcmpeq(pg, v, 0);
+
+            if (svptest_any(pg, c)) {
+                found = 1;
+                c = svbrkb_z(pg, c);
+                buf += i + svcntp_b8(pg, c);
+                break;
+            }
+        }
+    }
+#endif
+
     if (!found) {
         CHECK_EOF();
     }
