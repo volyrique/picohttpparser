@@ -34,9 +34,6 @@
 #include <x86intrin.h>
 #endif
 #endif
-#ifdef __ARM_FEATURE_SVE
-#include <arm_sve.h>
-#endif
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
@@ -139,30 +136,31 @@ static const char *findchar_fast(const char *buf, const char *buf_end, const cha
 static const char *findchar_nonprintable_fast(const char *buf, const char *buf_end, int *found)
 {
 #ifdef __ARM_FEATURE_SVE
-    *found = 0;
+    int f = 0;
 
-    for (uint64_t i = 0;; i = svqincb(i, 1)) {
-        const uint64_t len = buf_end - buf;
-        const svbool_t pg = svwhilelt_b8(i, len);
-
-        if (!svptest_first(svptrue_b8(), pg)) {
-            buf = buf_end;
-            break;
-        }
-
-        const svuint8_t v = svld1(pg, (const uint8_t *)buf + i);
-        svbool_t c = svcmplt(pg, v, '\041');
-
-        c = svorr_z(pg, c, svcmpeq(pg, v, '\177'));
-
-        if (svptest_any(pg, c)) {
-            *found = 1;
-            c = svbrkb_z(pg, c);
-            buf += i + svcntp_b8(pg, c);
-            break;
-        }
-    }
-
+    __asm__ (
+        "dup     z0.b, #127 \n\t"
+        "whilelo p0.b, %[buf], %[buf_end] \n"
+    "1: \n\t"
+        "ld1b    z1.b, p0/z, [%[buf]] \n\t"
+        "cmplo   p1.b, p0/z, z1.b, #33 \n\t"
+        "cmpeq   p2.b, p0/z, z0.b, z1.b \n\t"
+        "orrs    p1.b, p0/z, p1.b, p2.b \n\t"
+        "b.any   1f \n\t"
+        "uqincb  %[buf] \n\t"
+        "whilelo p0.b, %[buf], %[buf_end] \n\t"
+        "b.first 1b \n\t"
+        "mov     %[buf], %[buf_end] \n\t"
+        "b       2f \n"
+    "1: \n\t"
+        "brkb    p0.b, p0/z, p1.b \n\t"
+        "mov     %w[found], #1 \n\t"
+        "incp    %[buf], p0.b \n"
+    "2:" :
+        [buf] "+&r" (buf), [found] "+r" (f) :
+        [buf_end] "r" (buf_end), "m" (*(const char (*)[buf_end - buf]) buf) :
+        "z0", "z1", "p0", "p1", "p2", "cc");
+    *found = f;
     return buf;
 #elif defined(__ARM_NEON) && defined(__ARM_64BIT_STATE)
     *found = 0;
@@ -209,31 +207,39 @@ static const char *get_token_to_eol(const char *buf, const char *buf_end, const 
     if (found)
         goto FOUND_CTL;
 #elif defined(__ARM_FEATURE_SVE)
-    for (uint64_t i = 0;; i = svqincb(i, 1)) {
-        const uint64_t len = buf_end - buf;
-        const svbool_t pg = svwhilelt_b8(i, len);
+    int found = 0;
 
-        if (!svptest_first(svptrue_b8(), pg)) {
-            buf = buf_end;
-            break;
-        }
+    __asm__ (
+        "dup     z0.b, #127 \n"
+        "whilelo p0.b, %[buf], %[buf_end] \n"
+    "1: \n\t"
+        "ld1b    z1.b, p0/z, [%[buf]] \n\t"
+        "movprfx z2, z1 \n\t"
+        "sub     z2.b, z2.b, #32 \n\t"
+        "cmphs   p1.b, p0/z, z2.b, #95 \n\t"
+        "b.any   1f \n"
+    "2: \n\t"
+        "uqincb  %[buf] \n\t"
+        "whilelo p0.b, %[buf], %[buf_end] \n\t"
+        "b.first 1b \n\t"
+        "mov     %[buf], %[buf_end] \n\t"
+        "b       2f \n"
+    "1: \n\t"
+        "cmplo   p1.b, p0/z, z1.b, #32 \n\t"
+        "cmpeq   p2.b, p0/z, z0.b, z1.b \n\t"
+        "cmpne   p1.b, p1/z, z1.b, #9 \n\t"
+        "orrs    p1.b, p0/z, p1.b, p2.b \n\t"
+        "b.none  2b \n\t"
+        "brkb    p0.b, p0/z, p1.b \n\t"
+        "mov     %w[found], #1 \n\t"
+        "incp    %[buf], p0.b \n"
+    "2:" :
+        [buf] "+&r" (buf), [found] "+r" (found) :
+        [buf_end] "r" (buf_end), "m" (*(const char (*)[buf_end - buf]) buf) :
+        "z0", "z1", "z2", "p0", "p1", "p2", "cc");
 
-        const svuint8_t v = svld1(pg, (const uint8_t *)buf + i);
-        const uint8_t space = '\040';
-        svbool_t c = svcmpge(pg, svsub_x(pg, v, space), 0137u);
-
-        if (svptest_any(pg, c)) {
-            c = svcmplt(pg, v, space);
-            c = svcmpne(c, v, '\011');
-            c = svorr_z(pg, c, svcmpeq(pg, v, '\177'));
-
-            if (svptest_any(pg, c)) {
-                c = svbrkb_z(pg, c);
-                buf += i + svcntp_b8(pg, c);
-                goto FOUND_CTL;
-            }
-        }
-    }
+    if (found)
+        goto FOUND_CTL;
 #elif defined(__ARM_NEON) && defined(__ARM_64BIT_STATE)
     const size_t block_size = 2 * sizeof(uint8x16_t) - 1;
     const char *const end = (size_t)(buf_end - buf) >= block_size ? buf_end - block_size : buf;
@@ -397,6 +403,33 @@ static const char *parse_token(const char *buf, const char *buf_end, const char 
     const char *buf_start = buf;
     int found;
     buf = findchar_fast(buf, buf_end, ranges, sizeof(ranges) - 1, &found);
+
+#ifdef __ARM_FEATURE_SVE
+    const size_t len = buf_end - buf;
+
+    __asm__ (
+        "whilelo p0.s, %[buf], %[buf_end] \n"
+    "1: \n\t"
+        "ld1b    z0.s, p0/z, [%[buf]] \n\t"
+        "ld1b    { z0.s }, p0/z, [%[token_char_map], z0.s, UXTW] \n\t"
+        "cmpeq   p1.s, p0/z, z0.s, #0 \n\t"
+        "b.any   1f \n"
+        "uqincw  %[buf] \n\t"
+        "whilelo p0.s, %[buf], %[buf_end] \n\t"
+        "b.first 1b \n\t"
+        "mov     %[buf], %[buf_end] \n\t"
+        "b       2f \n"
+    "1: \n\t"
+        "brkb    p0.b, p0/z, p1.b \n\t"
+        "mov     %w[found], #1 \n\t"
+        "incp    %[buf], p0.s \n"
+    "2:" :
+        [buf] "+&r" (buf), [found] "+r" (found) :
+        [buf_end] "r" (buf_end), [token_char_map] "r" (token_char_map),
+        "m" (*(const char (*)[len]) buf), "m" (*(const char (*)[sizeof(token_char_map)]) token_char_map) :
+        "z0", "p0", "p1", "cc");
+#endif
+
     if (!found) {
         CHECK_EOF();
     }
