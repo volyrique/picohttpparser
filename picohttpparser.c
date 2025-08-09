@@ -34,6 +34,9 @@
 #include <x86intrin.h>
 #endif
 #endif
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 #include "picohttpparser.h"
 
 #if __GNUC__ >= 3
@@ -258,6 +261,39 @@ static const char *parse_token(const char *buf, const char *buf_end, const char 
     const char *buf_start = buf;
     int found;
     buf = findchar_fast(buf, buf_end, ranges, sizeof(ranges) - 1, &found);
+
+#if defined(__ARM_NEON) && defined(__ARM_64BIT_STATE)
+    if (!found) {
+        const size_t block_size = sizeof(uint8x16_t) - 1;
+        const char *const end = (size_t)(buf_end - buf) >= block_size ? buf_end - block_size : buf;
+
+        for (; buf < end; buf += sizeof(uint8x16_t)) {
+            // The values of the following vectors must be kept in sync with token_char_map.
+            const uint8x16_t high_nibble_table = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            const uint8x16_t low_nibble_table = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            uint8x16_t v = vld1q_u8((const uint8_t *)buf);
+            uint8x16_t v2 = vshrq_n_u8(v, 4);
+
+            v = vandq_u8(v, vmovq_n_u8(15));
+            v2 = vqtbl1q_u8(high_nibble_table, v2);
+            v = vqtbl1q_u8(low_nibble_table, v);
+            v = vtstq_u8(v, v2);
+
+            /* Pack the comparison result into 64 bits. */
+            const uint8x8_t rv = vshrn_n_u16(vreinterpretq_u16_u8(v), 4);
+            uint64_t offset = vget_lane_u64(vreinterpret_u64_u8(rv), 0);
+
+            if (offset) {
+                found = 1;
+                static_assert(sizeof(unsigned long long) == sizeof(uint64_t), "Need the number of leading 0-bits in uint64_t.");
+                /* offset uses 4 bits per byte of input. */
+                buf += __builtin_ctzll(offset) / 4;
+                break;
+            }
+        }
+    }
+#endif
+
     if (!found) {
         CHECK_EOF();
     }
